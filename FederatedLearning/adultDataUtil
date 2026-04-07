@@ -1,0 +1,57 @@
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, TensorDataset, Subset
+from datasets import load_dataset
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def load_adult_data():
+    dataset  = load_dataset("scikit-learn/adult-census-income")
+    df       = dataset["train"].to_pandas()
+    df       = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+    df["income"] = (df["income"] == ">50K").astype(int)
+    df       = df.replace("?", __import__("numpy").nan).dropna()
+
+    cat_cols = df.select_dtypes(include="object").columns.tolist()
+    for col in cat_cols:
+        df[col] = LabelEncoder().fit_transform(df[col])
+
+    X = df.drop("income", axis=1).values.astype(__import__("numpy").float32)
+    y = df["income"].values.astype(__import__("numpy").int64)
+
+    scaler = StandardScaler()
+    X      = scaler.fit_transform(X)
+
+    split        = int(0.8 * len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    train_dataset = TensorDataset(torch.tensor(X_train), torch.tensor(y_train))
+    test_dataset  = TensorDataset(torch.tensor(X_test),  torch.tensor(y_test))
+    return train_dataset, test_dataset, X_train.shape[1]
+
+def iid_partition(dataset, num_clients):
+    indices = np.random.permutation(len(dataset))
+    chunks  = np.array_split(indices, num_clients)
+    return [chunk.tolist() for chunk in chunks]
+
+def non_iid_partition(dataset, num_clients, shards_per_client=2):
+    labels  = np.array([dataset[i][1].item() for i in range(len(dataset))])
+    sorted_indices = np.argsort(labels)
+    num_shards     = num_clients * shards_per_client
+    shards         = np.array_split(sorted_indices, num_shards)
+    shard_indices  = np.random.permutation(num_shards)
+    client_data    = []
+    for i in range(num_clients):
+        assigned = shard_indices[i * shards_per_client:(i + 1) * shards_per_client]
+        combined = np.concatenate([shards[s] for s in assigned]).tolist()
+        client_data.append(combined)
+    return client_data
+
+def get_client_loader(dataset, indices, batch_size=32):
+    subset = Subset(dataset, indices)
+    return DataLoader(subset, batch_size=batch_size, shuffle=True)
+
+def get_test_loader(test_dataset, batch_size=64):
+    return DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
