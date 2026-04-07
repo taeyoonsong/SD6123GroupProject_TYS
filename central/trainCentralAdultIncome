@@ -19,12 +19,12 @@ def load_adult_data():
 
     train_df = dataset["train"].to_pandas()
 
-    # Strip whitespace from string columns
+    #Strip whitespace from string columns
     train_df = train_df.apply(
         lambda col: col.str.strip() if col.dtype == "object" else col
     )
 
-    # Target: income >50K = 1, else 0
+    #Target: income >50K = 1, else 0
     train_df["income"] = (train_df["income"] == ">50K").astype(int)
 
     train_df = train_df.replace("?", np.nan).dropna()
