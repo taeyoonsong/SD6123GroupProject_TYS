@@ -1,0 +1,139 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import time
+import numpy as np
+import flwr as fl
+from flwr.common import Context, ndarrays_to_parameters
+from flwr.client import ClientApp
+from flwr.server import ServerApp, ServerConfig, ServerAppComponents
+from flwr.server.strategy import FedAvg
+from models.mnist_model import MNISTModel
+from models.adult_model import AdultModel
+from fl.mnist_client import MNISTClient, get_partition as mnist_partition
+from fl.adult_client import AdultClient, get_partition as adult_partition
+from fl.adult_data_utils import load_adult_data
+
+#Config
+NUM_CLIENTS  = 20
+NUM_ROUNDS   = 20
+FRACTION_FIT = 0.5
+CLIENTS_PER_ROUND = int(NUM_CLIENTS * FRACTION_FIT)
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+def model_size_bytes(model):
+    return sum(p.numel() * p.element_size() for p in model.parameters())
+
+fmnist_model = MNISTModel()
+_, _, input_dim = load_adult_data()
+adult_model  = AdultModel(input_dim=input_dim)
+
+fmnist_bytes = model_size_bytes(fmnist_model)
+adult_bytes  = model_size_bytes(adult_model)
+
+print(f"Fashion-MNIST model size: {fmnist_bytes/1024:.2f} KB")
+print(f"Adult Income model size:  {adult_bytes/1024:.2f} KB")
+
+# ── Communication overhead calculation ───────────────────────────────────────
+def compute_comm_overhead(model_bytes, num_rounds, clients_per_round):
+
+    per_round_bytes = 2 * model_bytes * clients_per_round
+    total_bytes     = per_round_bytes * num_rounds
+    return per_round_bytes, total_bytes
+
+print("\n" + "="*60)
+print("COMMUNICATION OVERHEAD")
+print("="*60)
+
+for name, mb in [("Fashion-MNIST", fmnist_bytes), ("Adult Income", adult_bytes)]:
+    per_round, total = compute_comm_overhead(mb, NUM_ROUNDS, CLIENTS_PER_ROUND)
+    print(f"\n{name}:")
+    print(f"  Model size:           {mb/1024:.2f} KB")
+    print(f"  Clients per round:    {CLIENTS_PER_ROUND}")
+    print(f"  Per-round overhead:   {per_round/1024/1024:.4f} MB")
+    print(f"  Total ({NUM_ROUNDS} rounds):    {total/1024/1024:.4f} MB")
+    print(f"  vs centralized:       0 MB (all data local to server)")
+
+#wall clok times
+print("\n" + "="*60)
+print("COMPUTE TIME MEASUREMENT")
+print("="*60)
+
+def time_fl_run(algorithm, dataset, num_rounds=5):
+
+    if dataset == "Fashion-MNIST":
+        partitions = mnist_partition(NUM_CLIENTS, iid=True)
+        def client_fn(context: Context):
+            cid = int(context.node_id) % NUM_CLIENTS
+            return MNISTClient(
+                client_id=cid,
+                partition=partitions[cid],
+                device=device,
+                algorithm=algorithm,
+            ).to_client()
+        init_params = ndarrays_to_parameters(
+            [p.detach().numpy() for p in MNISTModel().parameters()]
+        )
+    else:
+        partitions = adult_partition(NUM_CLIENTS, iid=False)
+        def client_fn(context: Context):
+            cid = int(context.node_id) % NUM_CLIENTS
+            return AdultClient(
+                client_id=cid,
+                partition=partitions[cid],
+                device=device,
+                algorithm=algorithm,
+            ).to_client()
+        init_params = ndarrays_to_parameters(
+            [p.detach().numpy() for p in AdultModel(input_dim=input_dim).parameters()]
+        )
+
+    strategy = FedAvg(
+        fraction_fit=FRACTION_FIT,
+        fraction_evaluate=1.0,
+        min_fit_clients=CLIENTS_PER_ROUND,
+        min_evaluate_clients=NUM_CLIENTS,
+        min_available_clients=NUM_CLIENTS,
+        on_fit_config_fn=lambda rnd: {"local_epochs": 3},
+        initial_parameters=init_params,
+    )
+
+    def server_fn(context: Context) -> ServerAppComponents:
+        return ServerAppComponents(
+            strategy=strategy,
+            config=ServerConfig(num_rounds=num_rounds)
+        )
+
+    client_app = ClientApp(client_fn=client_fn)
+    server_app = ServerApp(server_fn=server_fn)
+
+    start = time.time()
+    fl.simulation.run_simulation(
+        server_app=server_app,
+        client_app=client_app,
+        num_supernodes=NUM_CLIENTS,
+    )
+    elapsed = time.time() - start
+
+    per_round = elapsed / num_rounds
+    print(f"  Total time ({num_rounds} rounds): {elapsed:.1f}s")
+    print(f"  Average per round:    {per_round:.1f}s")
+    print(f"  Estimated {NUM_ROUNDS} rounds:   {per_round*NUM_ROUNDS:.1f}s")
+    return elapsed, per_round
+
+# Time each algorithm on each dataset (5 rounds each for speed)
+results = {}
+for algo in ["fedavg", "fedprox"]:
+    for ds in ["Fashion-MNIST", "Adult Income"]:
+        total, per_round = time_fl_run(algo, ds, num_rounds=5)
+        results[f"{algo}_{ds}"] = (total, per_round)
+
+print("SUMMARY TABLE")
+print(f"\n{'Method':<12} {'Dataset':<15} {'Per Round':>12} {'Est. 20 Rounds':>15}")
+print("-"*57)
+for algo in ["fedavg", "fedprox"]:
+    for ds in ["Fashion-MNIST", "Adult Income"]:
+        total, per_round = results[f"{algo}_{ds}"]
+        print(f"{algo:<12} {ds:<15} {per_round:>10.1f}s {per_round*20:>13.1f}s")
