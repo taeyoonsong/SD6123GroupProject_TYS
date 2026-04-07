@@ -1,0 +1,170 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import time
+from torch.utils.data import DataLoader, TensorDataset, Subset, ConcatDataset
+from datasets import load_dataset
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from models.adult_model import AdultModel
+from privacy.mia import run_mia
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+def load_adult_data():
+    dataset = load_dataset("scikit-learn/adult-census-income")
+    df      = dataset["train"].to_pandas()
+    df      = df.apply(lambda col: col.str.strip() if col.dtype == "object" else col)
+    df["income"] = (df["income"] == ">50K").astype(int)
+    df      = df.replace("?", np.nan).dropna()
+    cat_cols = df.select_dtypes(include="object").columns.tolist()
+    for col in cat_cols:
+        df[col] = LabelEncoder().fit_transform(df[col])
+    X = df.drop("income", axis=1).values.astype(np.float32)
+    y = df["income"].values.astype(np.int64)
+    X = StandardScaler().fit_transform(X)
+    split = int(0.8 * len(X))
+    return X[:split], X[split:], y[:split], y[split:], X.shape[1]
+
+X_train, X_test, y_train, y_test, input_dim = load_adult_data()
+
+full_train   = TensorDataset(torch.tensor(X_train), torch.tensor(y_train))
+test_dataset = TensorDataset(torch.tensor(X_test),  torch.tensor(y_test))
+test_loader  = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+FORGET_SIZE = 200
+RETAIN_SIZE = 500
+np.random.seed(42)
+
+all_indices  = np.arange(len(full_train))
+forget_idx   = np.random.choice(all_indices, FORGET_SIZE, replace=False)
+remaining    = np.setdiff1d(all_indices, forget_idx)
+retain_idx   = np.random.choice(remaining, RETAIN_SIZE, replace=False)
+
+forget_dataset  = Subset(full_train, forget_idx.tolist())
+retain_dataset  = Subset(full_train, retain_idx.tolist())
+forget_loader   = DataLoader(forget_dataset, batch_size=32, shuffle=True)
+retain_loader   = DataLoader(retain_dataset, batch_size=32, shuffle=True)
+
+combined_idx     = np.concatenate([forget_idx, retain_idx])
+combined_dataset = Subset(full_train, combined_idx.tolist())
+combined_loader  = DataLoader(combined_dataset, batch_size=32, shuffle=True)
+
+print(f"Total train samples: {len(full_train)}")
+print(f"Forget set size:     {FORGET_SIZE}")
+print(f"Retain set size:     {RETAIN_SIZE} (small, to force memorisation)")
+print(f"Combined training:   {len(combined_idx)} samples")
+
+def evaluate(model, loader, label=""):
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            correct += model(data).argmax(1).eq(target).sum().item()
+            total   += len(target)
+    acc = correct / total
+    if label:
+        print(f"  {label}: {acc*100:.2f}%")
+    return acc
+
+def train_model(loader, epochs=10, lr=0.001):
+    model     = AdultModel(input_dim=input_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    model.train()
+    for epoch in range(epochs):
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            criterion(model(data), target).backward()
+            optimizer.step()
+    return model
+
+print("Original Model (trained on small dataset to force memorisation)")
+original_model = train_model(combined_loader, epochs=50, lr=0.001)
+evaluate(original_model, test_loader,    "Test accuracy (generalisation)")
+evaluate(original_model, forget_loader,  "Accuracy on forget set")
+evaluate(original_model, retain_loader,  "Accuracy on retain set")
+torch.save(original_model.state_dict(), "results/adult_overfit_unlearn.pth")
+print("  (Large gap between forget/retain and test = memorisation confirmed)")
+
+print("Full Retrain (without forget set)")
+start         = time.time()
+retrain_model = train_model(retain_loader, epochs=50)
+retrain_time  = time.time() - start
+print(f"  Retrain time: {retrain_time:.1f}s")
+evaluate(retrain_model, test_loader,    "Test accuracy")
+evaluate(retrain_model, forget_loader,  "Accuracy on forget set")
+evaluate(retrain_model, retain_loader,  "Accuracy on retain set")
+
+print("Approximate Unlearning (gradient ascent on forget set)")
+unlearn_model = AdultModel(input_dim=input_dim).to(device)
+unlearn_model.load_state_dict(
+    torch.load("results/adult_overfit_unlearn.pth", map_location=device)
+)
+
+optimizer = optim.Adam(unlearn_model.parameters(), lr=0.0003)
+criterion = nn.CrossEntropyLoss()
+
+start = time.time()
+
+unlearn_model.train()
+for epoch in range(15):
+    for data, target in forget_loader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        loss = criterion(unlearn_model(data), target)
+        (-loss).backward()
+        optimizer.step()
+
+optimizer2 = optim.Adam(unlearn_model.parameters(), lr=0.0001)
+for epoch in range(5):
+    for data, target in retain_loader:
+        data, target = data.to(device), target.to(device)
+        optimizer2.zero_grad()
+        criterion(unlearn_model(data), target).backward()
+        optimizer2.step()
+
+unlearn_time = time.time() - start
+print(f"  Unlearning time: {unlearn_time:.1f}s")
+evaluate(unlearn_model, test_loader,    "Test accuracy")
+evaluate(unlearn_model, forget_loader,  "Accuracy on forget set")
+evaluate(unlearn_model, retain_loader,  "Accuracy on retain set")
+
+print("\n" + "="*60)
+print("STEP 4: MIA on Forget Set")
+print("="*60)
+print("(Higher AUC = model still remembers forgotten samples)")
+
+print("\nOriginal model:")
+run_mia(original_model, forget_dataset, test_dataset, device,
+        n_samples=min(200, len(forget_dataset)),
+        label="Original | forget set as members")
+
+print("\nRetrained model:")
+run_mia(retrain_model, forget_dataset, test_dataset, device,
+        n_samples=min(200, len(forget_dataset)),
+        label="Retrain  | forget set as members")
+
+print("\nApproximate unlearning model:")
+run_mia(unlearn_model, forget_dataset, test_dataset, device,
+        n_samples=min(200, len(forget_dataset)),
+        label="Unlearn  | forget set as members")
+
+print("UNLEARNING SUMMARY")
+print(f"\n{'Method':<25} {'Test Acc':>10} {'Forget Acc':>12} {'Time':>8}")
+
+orig_test   = evaluate(original_model, test_loader)
+orig_forget = evaluate(original_model, forget_loader)
+ret_test    = evaluate(retrain_model,  test_loader)
+ret_forget  = evaluate(retrain_model,  forget_loader)
+unl_test    = evaluate(unlearn_model,  test_loader)
+unl_forget  = evaluate(unlearn_model,  forget_loader)
+
+print(f"{'Original':<25} {orig_test*100:>9.2f}% {orig_forget*100:>11.2f}% {'N/A':>8}")
+print(f"{'Full Retrain':<25} {ret_test*100:>9.2f}% {ret_forget*100:>11.2f}% {retrain_time:>7.1f}s")
+print(f"{'Approx Unlearning':<25} {unl_test*100:>9.2f}% {unl_forget*100:>11.2f}% {unlearn_time:>7.1f}s")
