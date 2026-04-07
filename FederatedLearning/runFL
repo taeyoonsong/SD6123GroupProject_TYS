@@ -1,0 +1,94 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+import torch
+import flwr as fl
+import numpy as np
+from flwr.common import Context, ndarrays_to_parameters
+from flwr.client import ClientApp
+from flwr.server import ServerApp, ServerConfig, ServerAppComponents
+from flwr.server.strategy import FedAvg
+from models.mnist_model import MNISTModel
+from fl.mnist_client import MNISTClient, get_partition
+from fl.scaffold_client import SCAFFOLDClient
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--algorithm", type=str, default="fedavg",
+                    choices=["fedavg", "fedprox", "scaffold"])
+parser.add_argument("--iid", action="store_true", default=False)
+parser.add_argument("--rounds", type=int, default=20)
+args = parser.parse_args()
+
+NUM_CLIENTS  = 20
+NUM_ROUNDS   = args.rounds
+FRACTION_FIT = 0.5
+IID          = args.iid
+ALGORITHM    = args.algorithm
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Device: {device} | Algorithm: {ALGORITHM} | IID: {IID} | "
+      f"Clients: {NUM_CLIENTS} | Rounds: {NUM_ROUNDS}")
+
+partitions       = get_partition(NUM_CLIENTS, iid=IID)
+round_accuracies = []
+
+def weighted_average(metrics):
+    accuracies = [m["accuracy"] * n for n, m in metrics]
+    total      = sum(n for n, _ in metrics)
+    acc        = sum(accuracies) / total
+    round_accuracies.append(acc)
+    print(f"  Round accuracy: {acc*100:.2f}%")
+    return {"accuracy": acc}
+
+def get_initial_parameters():
+    model        = MNISTModel()
+    model_params = [p.detach().numpy() for p in model.parameters()]
+    return ndarrays_to_parameters(model_params)
+
+def client_fn(context: Context):
+    client_id = int(context.node_id) % NUM_CLIENTS
+    if ALGORITHM == "scaffold":
+        return SCAFFOLDClient(
+            client_id=client_id,
+            partition=partitions[client_id],
+            device=device,
+        ).to_client()
+    else:
+        return MNISTClient(
+            client_id=client_id,
+            partition=partitions[client_id],
+            device=device,
+            algorithm=ALGORITHM,
+        ).to_client()
+
+strategy = FedAvg(
+    fraction_fit=FRACTION_FIT,
+    fraction_evaluate=1.0,
+    min_fit_clients=int(NUM_CLIENTS * FRACTION_FIT),
+    min_evaluate_clients=NUM_CLIENTS,
+    min_available_clients=NUM_CLIENTS,
+    evaluate_metrics_aggregation_fn=weighted_average,
+    on_fit_config_fn=lambda rnd: {"local_epochs": 3},  # increased from 1
+    initial_parameters=get_initial_parameters(),
+)
+
+def server_fn(context: Context) -> ServerAppComponents:
+    return ServerAppComponents(
+        strategy=strategy,
+        config=ServerConfig(num_rounds=NUM_ROUNDS)
+    )
+
+client_app = ClientApp(client_fn=client_fn)
+server_app = ServerApp(server_fn=server_fn)
+
+fl.simulation.run_simulation(
+    server_app=server_app,
+    client_app=client_app,
+    num_supernodes=NUM_CLIENTS,
+)
+
+print("Results")
+for i, acc in enumerate(round_accuracies, 1):
+    print(f"  Round {i:2d}: {acc*100:.2f}%")
+print(f"\n  Final accuracy:       {round_accuracies[-1]*100:.2f}%")
