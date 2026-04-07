@@ -1,0 +1,75 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import flwr as fl
+from models.adult_model import AdultModel
+from fl.adult_data_utils import load_adult_data, iid_partition, non_iid_partition, get_client_loader
+
+_train_dataset, _test_dataset, _input_dim = load_adult_data()
+
+def get_partition(num_clients, iid=True):
+    if iid:
+        return iid_partition(_train_dataset, num_clients)
+    else:
+        return non_iid_partition(_train_dataset, num_clients)
+
+class AdultClient(fl.client.NumPyClient):
+    def __init__(self, client_id, partition, device, algorithm="fedavg", mu=0.01):
+        self.client_id = client_id
+        self.device    = device
+        self.algorithm = algorithm
+        self.mu        = mu
+        self.loader    = get_client_loader(_train_dataset, partition)
+        self.model     = AdultModel(input_dim=_input_dim).to(device)
+        self.criterion = nn.CrossEntropyLoss()
+
+    def get_parameters(self, config):
+        return [p.detach().cpu().numpy() for p in self.model.parameters()]
+
+    def set_parameters(self, parameters):
+        for p, new_p in zip(self.model.parameters(), parameters):
+            p.data = torch.tensor(new_p).to(self.device)
+
+    def fit(self, parameters, config):
+        self.set_parameters(parameters)
+        global_params = [p.clone().detach() for p in self.model.parameters()]
+        optimizer     = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        local_epochs  = config.get("local_epochs", 1)
+        self.model.train()
+
+        for _ in range(local_epochs):
+            for data, target in self.loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                loss = self.criterion(self.model(data), target)
+
+                if self.algorithm == "fedprox":
+                    prox = sum(
+                        torch.norm(p - g) ** 2
+                        for p, g in zip(self.model.parameters(), global_params)
+                    )
+                    loss += (self.mu / 2) * prox
+
+                loss.backward()
+                optimizer.step()
+
+        return self.get_parameters(config={}), len(self.loader.dataset), {}
+
+    def evaluate(self, parameters, config):
+        self.set_parameters(parameters)
+        self.model.eval()
+        correct, total, loss_sum = 0, 0, 0.0
+        test_loader = get_client_loader(
+            _test_dataset, list(range(len(_test_dataset)))
+        )
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                output    = self.model(data)
+                loss_sum += self.criterion(output, target).item()
+                correct  += output.argmax(1).eq(target).sum().item()
+                total    += len(target)
+        return loss_sum / total, total, {"accuracy": correct / total}
