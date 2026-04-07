@@ -1,0 +1,49 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import DataLoader, Subset
+from sklearn.metrics import roc_auc_score, accuracy_score
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+def compute_losses(model, dataset, indices, device, batch_size=64):
+    #cross entropy
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    loader    = DataLoader(Subset(dataset, indices), batch_size=batch_size, shuffle=False)
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss   = criterion(output, target)
+            losses.extend(loss.cpu().numpy())
+    return np.array(losses)
+
+def run_mia(model, train_dataset, test_dataset, device, n_samples=1000, label=""):
+ 
+    #Sample indices
+    member_idx     = np.random.choice(len(train_dataset), n_samples, replace=False)
+    non_member_idx = np.random.choice(len(test_dataset),  n_samples, replace=False)
+
+    #Compute loss
+    member_losses     = compute_losses(model, train_dataset, member_idx,     device)
+    non_member_losses = compute_losses(model, test_dataset,  non_member_idx, device)
+
+    labels = np.concatenate([np.ones(n_samples), np.zeros(n_samples)])
+    losses = np.concatenate([member_losses, non_member_losses])
+
+    #Metrics
+    auc      = roc_auc_score(labels, scores)
+    threshold = np.percentile(losses, 50)  # median as threshold
+    preds    = (losses < threshold).astype(int)
+    acc      = accuracy_score(labels, preds)
+
+    print(f"\n[MIA] {label}")
+    print(f"  Attack AUC:      {auc:.4f}")
+    print(f"  Attack Accuracy: {acc*100:.2f}%")
+    print(f"  (Random baseline: AUC=0.50, Acc=50.00%)")
+    return auc, acc
